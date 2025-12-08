@@ -1,8 +1,2 @@
-commentjson
-imageio
-numpy
+ultralytics
 opencv-python-headless
-pybind11
-pyquaternion
-scipy
-tqdm

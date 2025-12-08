@@ -1,0 +1,10 @@
+# commentjson
+# imageio
+# numpy
+# opencv-python-headless
+# pybind11
+# pyquaternion
+# scipy
+# tqdm
+ultralytics
+opencv-python-headless
