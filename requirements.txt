@@ -1,2 +1,16 @@
+#Dependencies for the MESH360 project
 ultralytics
+rembg
+pillow
+onnxruntime
+onnxruntime-gpu
+
+#Default dependencies
 opencv-python-headless
+numpy
+commentjson
+imageio
+pybind11
+pyquaternion
+scipy
+tqdm
