@@ -26,3 +26,4 @@ __pycache__
 .DS_Store
 imgui.ini
 yolov8x.pt
+*.obj

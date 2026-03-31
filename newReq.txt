@@ -8,3 +8,5 @@
 # tqdm
 ultralytics
 opencv-python-headless
+realesrgan
+basicsr

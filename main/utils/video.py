@@ -2,8 +2,11 @@ import cv2
 import os
 import subprocess
 import math
+import io
+import json
 from rembg import remove, new_session
 import numpy as np
+from PIL import Image
 
 def get_video_length(video_path):
     """
@@ -81,7 +84,7 @@ def extract_frames_based_on_time(video_path, target_frames):
         str(fps),
         "--run_colmap",
         "--aabb_scale",
-        "32",
+        "2",
         "--overwrite",
     ]
 
@@ -89,266 +92,403 @@ def extract_frames_based_on_time(video_path, target_frames):
     print(f"Command: {' '.join(cmd)}\n")
     subprocess.run(cmd, check=True)
 
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    transforms_path = os.path.join(repo_root, "transforms.json")
+    _replace_transforms_image_extensions_to_png(transforms_path)
+
     return fps
 
 
-def yolo_segment_and_remove_background(image_path):
-    """Use YOLOv11 detections plus rembg to isolate objects into PNGs."""
+def _replace_transforms_image_extensions_to_png(transforms_path):
+    """Replace .jpg/.jpeg frame paths with .png in transforms.json."""
+    if not os.path.isfile(transforms_path):
+        raise FileNotFoundError(f"transforms.json not found at '{transforms_path}'.")
 
-    if not os.path.isdir(image_path):
-        print(f"Error: Directory '{image_path}' not found.")
-        return
+    with open(transforms_path, "r", encoding="utf-8") as transforms_file:
+        transforms_data = json.load(transforms_file)
 
-    image_extensions = (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
-    image_files = [f for f in os.listdir(image_path) if f.lower().endswith(image_extensions)]
+    frames = transforms_data.get("frames")
+    if not isinstance(frames, list):
+        raise ValueError(f"Invalid transforms format in '{transforms_path}': 'frames' must be a list.")
 
-    if not image_files:
-        print(f"No images found in '{image_path}'.")
-        return
-
-    output_dir = os.path.join("main", "data", "videos", "yolo_images")
-    os.makedirs(output_dir, exist_ok=True)
-
-    print(f"Processing {len(image_files)} images with YOLOv11 + rembg...")
-
-    try:
-        from ultralytics import YOLO
-    except ImportError:
-        print("Installing ultralytics for YOLO detection...")
-        subprocess.run(["pip", "install", "ultralytics"], check=True)
-        from ultralytics import YOLO
-
-    yolo_model = YOLO("yolo11x.pt")
-
-    try:
-        session = new_session("u2net", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-    except Exception as exc:
-        print(f"Warning: CUDA session failed ({exc}). Falling back to default provider.")
-        session = new_session("u2net")
-
-    for idx, filename in enumerate(image_files, 1):
-        src_path = os.path.join(image_path, filename)
-
-        original = cv2.imread(src_path, cv2.IMREAD_UNCHANGED)
-        if original is None:
-            print(f"Warning: Unable to read '{filename}', skipping.")
+    updated_count = 0
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        file_path = frame.get("file_path")
+        if not isinstance(file_path, str):
             continue
 
-        if original.ndim == 2:
-            det_input = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
-        elif original.shape[2] == 4:
-            det_input = cv2.cvtColor(original, cv2.COLOR_BGRA2BGR)
-        else:
-            det_input = original.copy()
+        file_root, file_ext = os.path.splitext(file_path)
+        if file_ext.lower() in (".jpg", ".jpeg"):
+            frame["file_path"] = f"{file_root}.png"
+            updated_count += 1
 
-        detections = yolo_model(det_input, verbose=False)[0]
-        boxes = detections.boxes
+    with open(transforms_path, "w", encoding="utf-8") as transforms_file:
+        json.dump(transforms_data, transforms_file, indent=2)
+        transforms_file.write("\n")
 
-        if boxes is not None and len(boxes) > 0:
-            xyxy = boxes.xyxy.cpu().numpy()
-            conf = boxes.conf.cpu().numpy()
-            areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
-            scores = conf * areas
-            best_idx = int(np.argmax(scores))
-            x1, y1, x2, y2 = xyxy[best_idx]
-            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+    print(f"Updated {updated_count} frame paths to .png in '{transforms_path}'.")
 
-            margin_x = int((x2 - x1) * 0.1)
-            margin_y = int((y2 - y1) * 0.1)
-            x1 = max(0, x1 - margin_x)
-            y1 = max(0, y1 - margin_y)
-            x2 = min(det_input.shape[1], x2 + margin_x)
-            y2 = min(det_input.shape[0], y2 + margin_y)
 
-            if x2 <= x1 or y2 <= y1:
-                x1, y1, x2, y2 = 0, 0, det_input.shape[1], det_input.shape[0]
-        else:
-            x1, y1, x2, y2 = 0, 0, det_input.shape[1], det_input.shape[0]
+def _enhance_image_for_processing(
+    image_bgr,
+    contrast_alpha,
+    contrast_beta,
+    saturation_scale,
+    sharpen_strength,
+):
+    """Boost contrast/colors and sharpen details before rembg."""
+    contrasted_bgr = cv2.convertScaleAbs(image_bgr, alpha=contrast_alpha, beta=contrast_beta)
 
-        roi = det_input[y1:y2, x1:x2]
-        if roi.size == 0:
-            print(f"Warning: Empty ROI for '{filename}', skipping.")
-            continue
+    hsv_image = cv2.cvtColor(contrasted_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv_image[:, :, 1] = np.clip(hsv_image[:, :, 1] * saturation_scale, 0, 255)
+    saturated_bgr = cv2.cvtColor(hsv_image.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
-        success, buffer = cv2.imencode(".png", roi)
-        if not success:
-            print(f"Warning: Could not encode ROI for '{filename}', skipping.")
-            continue
+    blurred_bgr = cv2.GaussianBlur(saturated_bgr, (0, 0), sigmaX=1.0, sigmaY=1.0)
+    sharpened_bgr = cv2.addWeighted(
+        saturated_bgr,
+        1.0 + sharpen_strength,
+        blurred_bgr,
+        -sharpen_strength,
+        0,
+    )
+    return sharpened_bgr
 
-        processed_bytes = remove(
-            buffer.tobytes(),
-            session=session,
-            only_mask=False,
-            alpha_matting=True,
-            alpha_matting_foreground_threshold=240,
-            alpha_matting_background_threshold=10,
+
+def _resolve_rembg_model_name(model_name):
+    """Map legacy BRIA model aliases to rembg session names."""
+    model_aliases = {
+        "bria-rmbg-1.4": "bria-rmbg",
+        "bria-rmbg-2.0": "bria-rmbg",
+    }
+    resolved_name = model_aliases.get(model_name, model_name)
+    if resolved_name != model_name:
+        print(f"Using rembg model '{resolved_name}' for requested '{model_name}'.")
+    return resolved_name
+
+
+def _initialize_rembg_session(model_name, available_providers):
+    """
+    Initialize rembg session with CUDA first, then explicit CPU fallback.
+
+    This avoids hard failures when onnxruntime reports CUDA provider availability
+    but runtime libs (e.g., libcudnn) are missing.
+    """
+    provider_attempts = []
+    if "CUDAExecutionProvider" in available_providers:
+        provider_attempts.append("CUDAExecutionProvider")
+    if "CPUExecutionProvider" in available_providers:
+        provider_attempts.append("CPUExecutionProvider")
+
+    if not provider_attempts:
+        raise RuntimeError(
+            "No supported onnxruntime providers found. "
+            "Expected CUDAExecutionProvider or CPUExecutionProvider."
         )
 
-        processed_array = np.frombuffer(processed_bytes, dtype=np.uint8)
-        roi_result = cv2.imdecode(processed_array, cv2.IMREAD_UNCHANGED)
-        if roi_result is None:
-            print(f"Warning: Could not decode processed ROI for '{filename}', skipping.")
+    if "CUDAExecutionProvider" in provider_attempts:
+        try:
+            import ctypes
+
+            ctypes.CDLL("libcudnn.so.9")
+        except OSError as exc:
+            print(
+                "CUDAExecutionProvider is present but CUDA runtime is incomplete "
+                f"({exc}). Falling back to CPUExecutionProvider."
+            )
+            provider_attempts = [provider for provider in provider_attempts if provider != "CUDAExecutionProvider"]
+
+    if not provider_attempts:
+        raise RuntimeError(
+            "CUDAExecutionProvider is unavailable at runtime and CPUExecutionProvider "
+            "is not available."
+        )
+
+    last_provider_error = None
+    for provider_name in provider_attempts:
+        try:
+            session = new_session(model_name, providers=[provider_name])
+            return session, provider_name
+        except ValueError:
+            raise
+        except Exception as exc:
+            last_provider_error = exc
+            if provider_name == "CUDAExecutionProvider" and "CPUExecutionProvider" in provider_attempts:
+                print(
+                    f"Failed to initialize CUDAExecutionProvider ({exc}). "
+                    "Falling back to CPUExecutionProvider."
+                )
+                continue
+            raise RuntimeError(
+                f"Failed to initialize rembg session with {provider_name}: {exc}"
+            ) from exc
+
+    raise RuntimeError(f"Failed to initialize rembg session: {last_provider_error}") from last_provider_error
+
+
+def _resolve_yolo_model_path(yolo_model_path):
+    """Resolve YOLO model path from cwd or repo root."""
+    if os.path.isabs(yolo_model_path) and os.path.isfile(yolo_model_path):
+        return yolo_model_path
+    if os.path.isfile(yolo_model_path):
+        return os.path.abspath(yolo_model_path)
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidate_path = os.path.join(repo_root, yolo_model_path)
+    if os.path.isfile(candidate_path):
+        return candidate_path
+
+    raise FileNotFoundError(f"YOLO model file '{yolo_model_path}' was not found.")
+
+
+def _select_primary_bbox_xyxy(yolo_result):
+    """Select one primary YOLO bbox as [x1, y1, x2, y2]."""
+    boxes = getattr(yolo_result, "boxes", None)
+    if boxes is None or boxes.xyxy is None or len(boxes) == 0:
+        return None
+
+    boxes_xyxy = boxes.xyxy.detach().cpu().numpy()
+    if boxes_xyxy.size == 0:
+        return None
+
+    if boxes.conf is not None:
+        confidences = boxes.conf.detach().cpu().numpy()
+    else:
+        confidences = np.ones(len(boxes_xyxy), dtype=np.float32)
+
+    widths = np.clip(boxes_xyxy[:, 2] - boxes_xyxy[:, 0], 0.0, None)
+    heights = np.clip(boxes_xyxy[:, 3] - boxes_xyxy[:, 1], 0.0, None)
+    areas = widths * heights
+    best_index = int(np.argmax(confidences * np.maximum(areas, 1e-6)))
+    return boxes_xyxy[best_index].astype(np.float64)
+
+
+def _bbox_from_alpha_mask(image_path):
+    """Fallback bbox from non-zero alpha pixels on rembg output."""
+    image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if image is None or image.ndim != 3 or image.shape[2] != 4:
+        return None, None, None
+
+    image_height, image_width = image.shape[:2]
+    alpha = image[:, :, 3]
+    ys, xs = np.where(alpha > 0)
+    if xs.size == 0 or ys.size == 0:
+        return None, image_width, image_height
+
+    bbox_xyxy = np.array([xs.min(), ys.min(), xs.max(), ys.max()], dtype=np.float64)
+    return bbox_xyxy, image_width, image_height
+
+
+def _normalize_pixel_coord(pixel_value, image_size, aabb_scale):
+    """Normalize pixel coordinate to instant-ngp coordinate space."""
+    return (float(pixel_value) / float(image_size) - 0.5) * float(aabb_scale)
+
+
+def add_yolo_render_aabb_from_first_last_frames(
+    image_paths,
+    transforms_path,
+    yolo_model_path="yolo11n-seg.pt",
+    conf=0.25,
+):
+    """
+    Use YOLOv8 on first/last frame and inject render_aabb crop into transforms.json.
+
+    Pixel bbox values are normalized as:
+    (pixel / image_size - 0.5) * aabb_scale
+    """
+    if not image_paths:
+        raise ValueError("No image paths were provided for YOLO render_aabb extraction.")
+    if not os.path.isfile(transforms_path):
+        raise FileNotFoundError(f"transforms.json not found at '{transforms_path}'.")
+    if conf < 0 or conf > 1:
+        raise ValueError("conf must be in [0, 1].")
+
+    with open(transforms_path, "r", encoding="utf-8") as transforms_file:
+        transforms_data = json.load(transforms_file)
+
+    aabb_scale = transforms_data.get("aabb_scale")
+    if not isinstance(aabb_scale, (int, float)) or aabb_scale <= 0:
+        raise ValueError(
+            f"Invalid or missing aabb_scale in '{transforms_path}'. "
+            "Expected a positive number."
+        )
+
+    sorted_image_paths = sorted(image_paths)
+    first_frame_path = sorted_image_paths[0]
+    last_frame_path = sorted_image_paths[-1]
+    selected_paths = [first_frame_path] if first_frame_path == last_frame_path else [first_frame_path, last_frame_path]
+
+    try:
+        from ultralytics import YOLO
+    except ImportError as exc:
+        raise ImportError("ultralytics is required for YOLO-based render_aabb extraction.") from exc
+
+    resolved_model_path = _resolve_yolo_model_path(yolo_model_path)
+    yolo_model = YOLO(resolved_model_path)
+    yolo_results = yolo_model.predict(source=selected_paths, conf=conf, verbose=False)
+
+    normalized_x = []
+    normalized_y = []
+    for image_path, yolo_result in zip(selected_paths, yolo_results):
+        bbox_xyxy = _select_primary_bbox_xyxy(yolo_result)
+        image_width = None
+        image_height = None
+        if hasattr(yolo_result, "orig_shape") and yolo_result.orig_shape is not None:
+            image_height, image_width = yolo_result.orig_shape
+
+        if bbox_xyxy is None:
+            fallback_bbox, fallback_width, fallback_height = _bbox_from_alpha_mask(image_path)
+            if fallback_bbox is not None:
+                bbox_xyxy = fallback_bbox
+                image_width = fallback_width
+                image_height = fallback_height
+
+        if bbox_xyxy is None:
+            raise ValueError(f"YOLO could not detect an object bbox for frame '{image_path}'.")
+        if image_width is None or image_height is None:
+            raise ValueError(f"Could not resolve image dimensions for frame '{image_path}'.")
+
+        x1, y1, x2, y2 = bbox_xyxy.tolist()
+        x1 = float(np.clip(x1, 0.0, image_width - 1))
+        y1 = float(np.clip(y1, 0.0, image_height - 1))
+        x2 = float(np.clip(x2, 0.0, image_width - 1))
+        y2 = float(np.clip(y2, 0.0, image_height - 1))
+
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError(f"Invalid YOLO bbox for frame '{image_path}': {[x1, y1, x2, y2]}")
+
+        normalized_x.extend(
+            [
+                _normalize_pixel_coord(x1, image_width, aabb_scale),
+                _normalize_pixel_coord(x2, image_width, aabb_scale),
+            ]
+        )
+        normalized_y.extend(
+            [
+                _normalize_pixel_coord(y1, image_height, aabb_scale),
+                _normalize_pixel_coord(y2, image_height, aabb_scale),
+            ]
+        )
+
+    render_aabb_min = [min(normalized_x), min(normalized_y), -0.5 * float(aabb_scale)]
+    render_aabb_max = [max(normalized_x), max(normalized_y), 0.5 * float(aabb_scale)]
+    transforms_data["render_aabb"] = [render_aabb_min, render_aabb_max]
+
+    with open(transforms_path, "w", encoding="utf-8") as transforms_file:
+        json.dump(transforms_data, transforms_file, indent=2)
+        transforms_file.write("\n")
+
+    print(
+        f"Updated render_aabb in '{transforms_path}' from YOLO first/last frames: "
+        f"min={render_aabb_min}, max={render_aabb_max}"
+    )
+    return transforms_data["render_aabb"]
+
+
+def contrast_segment_and_remove_background(
+    image_dir,
+    yolo_model_path="yolo11n-seg.pt",
+    rembg_model_name="bria-rmbg",
+    contrast_alpha=1.6,
+    contrast_beta=8,
+    saturation_scale=1.65,
+    sharpen_strength=1.0,
+    conf=0.25,
+):
+    """
+    Apply stronger enhancement, then BRIA rembg background removal.
+
+    `yolo_model_path` and `conf` are kept for backward compatibility with older
+    call sites, but YOLO segmentation is intentionally skipped to match
+    `rembg p -m bria-rmbg` style behavior.
+    """
+    if not os.path.isdir(image_dir):
+        raise ValueError(f"Image directory '{image_dir}' does not exist.")
+    if saturation_scale <= 0:
+        raise ValueError("saturation_scale must be greater than 0.")
+    if sharpen_strength < 0:
+        raise ValueError("sharpen_strength must be non-negative.")
+
+    image_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+    image_files = sorted(
+        [
+            file_name
+            for file_name in os.listdir(image_dir)
+            if file_name.lower().endswith(image_extensions)
+            and os.path.isfile(os.path.join(image_dir, file_name))
+        ]
+    )
+    if not image_files:
+        raise ValueError(f"No images found in '{image_dir}'.")
+
+
+    import onnxruntime as ort
+
+    available_providers = ort.get_available_providers()
+    resolved_rembg_model_name = _resolve_rembg_model_name(rembg_model_name)
+    try:
+        rembg_session, active_provider = _initialize_rembg_session(
+            resolved_rembg_model_name,
+            available_providers=available_providers,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"No session class found for model '{rembg_model_name}'. "
+            "For BRIA, use 'bria-rmbg' with this rembg version."
+        ) from exc
+    processed_count = 0
+    output_paths = []
+
+    for file_name in image_files:
+        image_path = os.path.join(image_dir, file_name)
+        image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if image_bgr is None:
+            print(f"Skipping unreadable image: {image_path}")
             continue
 
-        if roi_result.ndim == 2:
-            roi_result = cv2.cvtColor(roi_result, cv2.COLOR_GRAY2BGRA)
-        elif roi_result.shape[2] == 3:
-            roi_result = cv2.cvtColor(roi_result, cv2.COLOR_BGR2BGRA)
+        enhanced_bgr = _enhance_image_for_processing(
+            image_bgr=image_bgr,
+            contrast_alpha=contrast_alpha,
+            contrast_beta=contrast_beta,
+            saturation_scale=saturation_scale,
+            sharpen_strength=sharpen_strength,
+        )
 
-        if roi_result.shape[0] != (y2 - y1) or roi_result.shape[1] != (x2 - x1):
-            roi_result = cv2.resize(roi_result, (x2 - x1, y2 - y1), interpolation=cv2.INTER_LINEAR)
+        enhanced_rgb = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
+        enhanced_image = Image.fromarray(enhanced_rgb)
+        image_buffer = io.BytesIO()
+        enhanced_image.save(image_buffer, format="PNG")
+        rembg_bytes = remove(
+            image_buffer.getvalue(),
+            session=rembg_session,
+            force_return_bytes=True,
+        )
 
-        rgb_full = np.zeros((det_input.shape[0], det_input.shape[1], 3), dtype=np.float32)
-        alpha_full = np.zeros((det_input.shape[0], det_input.shape[1]), dtype=np.float32)
+        if not isinstance(rembg_bytes, (bytes, bytearray)):
+            raise TypeError(f"Unexpected rembg output type: {type(rembg_bytes)}")
 
-        roi_rgb = roi_result[:, :, :3].astype(np.float32)
-        roi_alpha = roi_result[:, :, 3].astype(np.float32) / 255.0
+        output_image = Image.open(io.BytesIO(rembg_bytes)).convert("RGBA")
+        output_path = os.path.splitext(image_path)[0] + ".png"
+        output_image.save(output_path, format="PNG")
 
-        rgb_full[y1:y2, x1:x2] = roi_rgb
-        alpha_full[y1:y2, x1:x2] = roi_alpha
+        if output_path != image_path and image_path.lower().endswith((".jpg", ".jpeg")):
+            os.remove(image_path)
 
-        output_rgba = np.zeros((det_input.shape[0], det_input.shape[1], 4), dtype=np.uint8)
-        output_rgba[:, :, :3] = np.clip(rgb_full, 0, 255).astype(np.uint8)
-        output_rgba[:, :, 3] = np.clip(alpha_full * 255.0, 0, 255).astype(np.uint8)
+        processed_count += 1
+        output_paths.append(output_path)
 
-        base_name, _ = os.path.splitext(filename)
-        dest_path = os.path.join(output_dir, f"{base_name}.png")
-        cv2.imwrite(dest_path, output_rgba)
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    transforms_path = os.path.join(repo_root, "transforms.json")
+    add_yolo_render_aabb_from_first_last_frames(
+        image_paths=output_paths,
+        transforms_path=transforms_path,
+        yolo_model_path=yolo_model_path,
+        conf=conf,
+    )
 
-        if idx % 10 == 0 or idx == len(image_files):
-            print(f"Processed {idx}/{len(image_files)} images")
-
-    print(f"Segmentation complete. Results saved to {output_dir}.")
-
-
-
-# def background_remover(image_path):
-#     """Detect objects with YOLO, clean backgrounds via rembg, and overwrite images."""
-
-#     if not os.path.isdir(image_path):
-#         print(f"Error: Directory '{image_path}' not found.")
-#         return
-
-#     image_extensions = (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
-#     image_files = [f for f in os.listdir(image_path) if f.lower().endswith(image_extensions)]
-
-#     if not image_files:
-#         print(f"No images found in '{image_path}'.")
-#         return
-
-#     print(f"Processing {len(image_files)} images with YOLO-assisted rembg (GPU)...")
-
-#     try:
-#         from ultralytics import YOLO
-#     except ImportError:
-#         print("Installing ultralytics for YOLO detection...")
-#         subprocess.run(["pip", "install", "ultralytics"], check=True)
-#         from ultralytics import YOLO
-
-#     yolo_model = YOLO("yolov8x.pt")
-
-#     try:
-#         session = new_session("u2net", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-#     except Exception as exc:
-#         print(f"Warning: CUDA session failed ({exc}). Falling back to default provider.")
-#         session = new_session("u2net")
-
-#     for idx, filename in enumerate(image_files, 1):
-#         src_path = os.path.join(image_path, filename)
-
-#         original = cv2.imread(src_path, cv2.IMREAD_UNCHANGED)
-#         if original is None:
-#             print(f"Warning: Unable to read '{filename}', skipping.")
-#             continue
-
-#         if original.ndim == 2:
-#             det_input = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
-#         elif original.shape[2] == 4:
-#             det_input = cv2.cvtColor(original, cv2.COLOR_BGRA2BGR)
-#         else:
-#             det_input = original.copy()
-
-#         detections = yolo_model(det_input, verbose=False)[0]
-#         boxes = detections.boxes
-
-#         if boxes is not None and len(boxes) > 0:
-#             xyxy = boxes.xyxy.cpu().numpy()
-#             conf = boxes.conf.cpu().numpy()
-#             areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
-#             scores = conf * areas
-#             best_idx = int(np.argmax(scores))
-#             x1, y1, x2, y2 = xyxy[best_idx]
-#             x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-
-#             margin_x = int((x2 - x1) * 0.1)
-#             margin_y = int((y2 - y1) * 0.1)
-#             x1 = max(0, x1 - margin_x)
-#             y1 = max(0, y1 - margin_y)
-#             x2 = min(det_input.shape[1], x2 + margin_x)
-#             y2 = min(det_input.shape[0], y2 + margin_y)
-
-#             if x2 <= x1 or y2 <= y1:
-#                 x1, y1, x2, y2 = 0, 0, det_input.shape[1], det_input.shape[0]
-#         else:
-#             x1, y1, x2, y2 = 0, 0, det_input.shape[1], det_input.shape[0]
-
-#         roi = det_input[y1:y2, x1:x2]
-#         if roi.size == 0:
-#             print(f"Warning: Empty ROI for '{filename}', skipping.")
-#             continue
-
-#         success, buffer = cv2.imencode(".png", roi)
-#         if not success:
-#             print(f"Warning: Could not encode ROI for '{filename}', skipping.")
-#             continue
-
-#         processed_bytes = remove(
-#             buffer.tobytes(),
-#             session=session,
-#             only_mask=False,
-#             alpha_matting=True,
-#             alpha_matting_foreground_threshold=240,
-#             alpha_matting_background_threshold=10,
-#         )
-
-#         processed_array = np.frombuffer(processed_bytes, dtype=np.uint8)
-#         roi_result = cv2.imdecode(processed_array, cv2.IMREAD_UNCHANGED)
-#         if roi_result is None:
-#             print(f"Warning: Could not decode processed ROI for '{filename}', skipping.")
-#             continue
-
-#         if roi_result.ndim == 2:
-#             roi_result = cv2.cvtColor(roi_result, cv2.COLOR_GRAY2BGRA)
-#         elif roi_result.shape[2] == 3:
-#             roi_result = cv2.cvtColor(roi_result, cv2.COLOR_BGR2BGRA)
-
-#         if roi_result.shape[0] != (y2 - y1) or roi_result.shape[1] != (x2 - x1):
-#             roi_result = cv2.resize(roi_result, (x2 - x1, y2 - y1), interpolation=cv2.INTER_LINEAR)
-
-#         rgb_full = np.zeros((det_input.shape[0], det_input.shape[1], 3), dtype=np.float32)
-#         alpha_full = np.zeros((det_input.shape[0], det_input.shape[1]), dtype=np.float32)
-
-#         roi_rgb = roi_result[:, :, :3].astype(np.float32)
-#         roi_alpha = roi_result[:, :, 3].astype(np.float32) / 255.0
-
-#         rgb_full[y1:y2, x1:x2] = roi_rgb
-#         alpha_full[y1:y2, x1:x2] = roi_alpha
-
-#         output_rgba = np.zeros((det_input.shape[0], det_input.shape[1], 4), dtype=np.uint8)
-#         output_rgba[:, :, :3] = np.clip(rgb_full, 0, 255).astype(np.uint8)
-#         output_rgba[:, :, 3] = np.clip(alpha_full * 255.0, 0, 255).astype(np.uint8)
-
-#         base_name, _ = os.path.splitext(filename)
-#         dest_path = os.path.join(image_path, f"{base_name}.png")
-#         cv2.imwrite(dest_path, output_rgba)
-
-#         if dest_path != src_path and os.path.exists(src_path):
-#             try:
-#                 os.remove(src_path)
-#             except OSError:
-#                 pass
-
-#         if idx % 10 == 0 or idx == len(image_files):
-#             print(f"Processed {idx}/{len(image_files)} images")
-
-#     print("Background removal complete.")
+    print(
+        f"Processed {processed_count} images in '{image_dir}' "
+        f"with stronger enhancement + BRIA rembg ({active_provider})."
+    )
+    return processed_count
